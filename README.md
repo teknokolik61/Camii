@@ -224,3 +224,11 @@ Güvenlik Notu
 WiFiClientSecure.setInsecure() kullanıldığı için TLS sertifika doğrulaması yapılmaz.
 
 Bu pratikte çalışmayı kolaylaştırır ama güvenlik açısından daha zayıftır.
+
+
+
+
+
+
+
+python tools/uart_push.py COM3 tools/config.txt
