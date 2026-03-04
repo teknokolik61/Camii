@@ -14,7 +14,7 @@ ESP32 tabanlı cami şerefesi (minare ışıkları) otomasyon sistemi. Namaz vak
 - Diyanet İşleri Başkanlığı API'sinden namaz vakitlerini otomatik çeker (30 günlük cache)
 - Akşam ezanında şerefeler açılır, sabah ezanında kapanır
 - Tolerans ayarı: açılma ve kapanma dakikası öne/arkaya kaydırılabilir (0-30 dk)
-- İmsak saatinde zorunlu kapanma (Sabah'a kadar açılamaz)
+- İmsak saatinde zorunlu kapanma (Akşam vaktine'a kadar açılamaz)
 - Perşembe-Cuma gecesi otomatik açılma desteği
 - Haftalık otomatik güncelleme (Pazartesi 03:05)
 
@@ -70,7 +70,7 @@ Tam özellikli responsive web arayüzü (7 sekme):
 
 ### Güvenlik ve Koruma
 
-**OTA Board Doğrulama:** Firmware'e gömülü board parmak izi ile yanlış cihaza yükleme engellenir. JavaScript tarafında .bin dosyası upload'dan önce kontrol edilir, sunucu tarafında header ile ikinci doğrulama yapılır.
+**OTA Board Doğrulama:** Firmware'e gömülü board modeli ile yanlış cihaza yükleme engellenir. JavaScript tarafında .bin dosyası upload'dan önce kontrol edilir, sunucu tarafında header ile ikinci doğrulama yapılır.
 
 **OTA Versiyon Kontrolü:** Firmware'deki sayısal versiyon numarası ile eski/aynı versiyonun yüklenmesi engellenir.
 
@@ -80,7 +80,7 @@ Tam özellikli responsive web arayüzü (7 sekme):
 
 **Watchdog Timer:** 30 saniye içinde loop tamamlanmazsa otomatik restart. Boot'ta restart nedeni loglanır ve Telegram'a bildirilir.
 
-**Heap Koruma:** 5 dakikada bir heap kontrolü, 10KB altında otomatik restart ile bellek sızıntısı koruması.
+**Heap Koruma:** 5 dakikada bir heap kontrolü, 10KB altında otomatik restart ile bellek sıkıntısı koruması.
 
 **Güç Kesintisi Tespiti:** Son çalışma zamanı NVS'e periyodik kaydedilir, boot'ta kesinti süresi hesaplanarak Telegram'a bildirilir.
 
@@ -95,7 +95,7 @@ Tam özellikli responsive web arayüzü (7 sekme):
 | Board | BOARD_TYPE | Relay GPIO | Button GPIO | Flash |
 |-------|-----------|------------|-------------|-------|
 | ESP32 DevKit v1 | 1 | 23 | 27 | 4MB |
-| ESP32-S3-N16R8 | 2 | 4 | 5 | 16MB |
+| ESP32-S3-N16R8  | 2 | 4  | 5  | 16MB |
 
 Tek firmware dosyası tüm boardlarda çalışır. Board farkları `platformio.ini`'den derleme zamanında belirlenir.
 
@@ -111,7 +111,7 @@ Tek firmware dosyası tüm boardlarda çalışır. Board farkları `platformio.i
 
 ### 1. Depoyu Klonla
 ```bash
-git clone https://github.com/KULLANICI/cami-otomasyon.git
+git clone https://github.com/teknokolik61/cami.git
 cd cami-otomasyon
 ```
 
