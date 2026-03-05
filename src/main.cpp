@@ -30,6 +30,20 @@
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+
+// PSRAM allocator for ArduinoJson (ESP32-S3 8MB PSRAM)
+struct PsramAllocator {
+  void* allocate(size_t size) {
+    if (psramFound()) return ps_malloc(size);
+    return malloc(size);
+  }
+  void deallocate(void* ptr) { free(ptr); }
+  void* reallocate(void* ptr, size_t size) {
+    if (psramFound()) return ps_realloc(ptr, size);
+    return realloc(ptr, size);
+  }
+};
+using PsramJsonDocument = BasicJsonDocument<PsramAllocator>;
 #include <cstring>  // memcmp
 #include <Preferences.h>
 #include <time.h>
@@ -136,8 +150,8 @@ static void cpuWindowUpdate() {
   g_cpuDelayUs = 0;
 }
 
-static const char* APP_VERSION = "v12.040"; // 6-feature update
-static const int   FW_VER_NUM  = 12040;    // sayısal versiyon (OTA karşılaştırma)
+static const char* APP_VERSION = "v12.041"; // 12-item refactor
+static const int   FW_VER_NUM  = 12041;    // sayısal versiyon (OTA karşılaştırma)
 static const char* APP_AUTHOR  = "Miraç Bahadır ÖZTÜRK";
 
 // =====================
@@ -574,6 +588,7 @@ UniversalTelegramBot* _pBot = nullptr;
 #define bot (*_pBot)
 
 static void reinitBot(const String& token) {
+  if (token == g_botToken && _pBot) return; // Aynı token, gereksiz new/delete yapma
   g_botToken = token;
   if (_pBot) delete _pBot;
   _pBot = new UniversalTelegramBot(token, tgClient);
@@ -910,6 +925,7 @@ static bool g_tgInsecureSet = false;
 static void tgPrepare(uint16_t timeoutMs = 12000) {
   if (!g_tgInsecureSet) {
     tgClient.setInsecure();
+    tgClient.setHandshakeTimeout(10); // TLS handshake timeout 10sn (default 0=infinite)
     g_tgInsecureSet = true;
   }
   tgClient.setTimeout(timeoutMs);
@@ -960,7 +976,7 @@ static void logSerialAndTg(const String& msg, bool notifyTg = true, bool forceTg
 static String fetchExternalIp() {
   if (WiFi.status() != WL_CONNECTED) return "";
   HTTPClient http;
-  http.setTimeout(5000);
+  http.setTimeout(3000); // 3sn timeout (boot gecikmesini azalt)
   http.begin("http://api.ipify.org");
   int code = http.GET();
   String ip = "";
@@ -1301,7 +1317,7 @@ static bool fetchAndStoreMonthly(bool notifyTg = true) {
   filter[0]["Aksam"]                  = true;
   filter[0]["HicriTarihUzun"]         = true;
 
-  DynamicJsonDocument doc(64 * 1024);
+  PsramJsonDocument doc(64 * 1024); // PSRAM'da allocate (ana heap'i korur)
   if (doc.capacity() == 0) {
     logSerialAndTg("❌ JSON buffer alloc FAIL (heap yetersiz). Free=" + String((int)ESP.getFreeHeap()), notifyTg, true);
     return false;
@@ -1483,19 +1499,25 @@ static void wifiKeepAlive() {
     if (st == WL_CONNECTED) {
       logSerialAndTg("📶 WiFi BAGLANDI. IP=" + WiFi.localIP().toString(), false, false);
       g_autoMenuPending = true;
-      // İlk bağlantıda dış IP al ve Telegram'a bildir
+      // İlk bağlantıda Telegram'a boot mesajı gönder (IP sonra gelir)
       static bool _bootIpSent = false;
+      static bool _extIpPending = false;
       if (!_bootIpSent) {
         _bootIpSent = true;
-        String extIp = fetchExternalIp();
         esp_reset_reason_t br = esp_reset_reason();
         String bootMsg = "🚀 Sistem basladi\n📡 LAN: " + WiFi.localIP().toString();
-        if (extIp.length() > 0) bootMsg += "\n🌐 Dis IP: " + extIp;
         if (br == ESP_RST_TASK_WDT) bootMsg += "\n⚠️ Onceki kapanma: Watchdog";
         else if (br == ESP_RST_PANIC) bootMsg += "\n⚠️ Onceki kapanma: Panic";
         bootMsg += "\n🔖 " + String(APP_VERSION) + " (" + BOARD_NAME + ")";
         tgSend(bootMsg, true);
         logSys("WiFi baglandi, IP=" + WiFi.localIP().toString());
+        _extIpPending = true; // Dış IP'yi sonra al
+      }
+      // Dış IP'yi ayrı adımda al (boot mesajını bloklama)
+      if (_extIpPending) {
+        _extIpPending = false;
+        String extIp = fetchExternalIp();
+        if (extIp.length() > 0) tgSend("🌐 Dis IP: " + extIp, true);
       }
       g_wifiRetryIntervalMs = 15000; // backoff sıfırla
       g_wifiDisconnectedSinceMs = 0; // watchdog sıfırla
@@ -1822,6 +1844,9 @@ static void weeklyUpdateTick() {
 // =====================
 static void weeklyRestartTick() {
   if (!isTimeValid()) return;
+  static uint32_t lastCheckMs = 0;
+  if (millis() - lastCheckMs < 60000) return; // Dakikada bir kontrol yeterli
+  lastCheckMs = millis();
   static uint32_t lastCheckDay = 0;
   time_t now = time(nullptr);
   struct tm* t = localtime(&now);
@@ -1830,12 +1855,68 @@ static void weeklyRestartTick() {
   // Salı (tm_wday==2), saat 04:00-04:05 arası, günde bir kez
   if (t->tm_wday == 2 && t->tm_hour == 4 && t->tm_min < 5 && ymd != lastCheckDay) {
     lastCheckDay = ymd;
+    // OTA veya güncelleme devam ediyorsa atlat
+    if (g_webOtaInProgress || g_updateInProgress) {
+      Serial.println("[MAINT] Haftalik restart ertelendi (OTA/guncelleme aktif)");
+      return;
+    }
     Serial.println("[MAINT] Haftalik otomatik restart...");
     logSys("Haftalik otomatik restart");
     tgSend("🔄 Haftalık bakım: otomatik yeniden başlatma", true);
     delay(500);
     ESP.restart();
   }
+}
+
+// =====================
+// Birleşik röle kontrolü (tüm kaynaklar için tek nokta)
+// source: "BUTON", "TG", "TG Panel", "WEB"
+// who: kullanıcı bilgisi (Telegram'dan gelen ad)
+// Dönüş: 0=OK, 1=blocked (imsak), 2=zaten açık (buton için)
+// =====================
+static int manualRelayOn(const char* source, const String& who = "") {
+  g_manualOffUntilTs = 0;
+
+  // İmsak OFF sonrası engel kontrolü
+  if (isTimeValid()) {
+    time_t noff = 0;
+    if (computeNextImsakOff(time(nullptr), noff)) g_nextImsakOffTs = noff;
+    if (g_blockOnUntilTs != 0 && time(nullptr) < g_blockOnUntilTs) {
+      return 1; // blocked
+    }
+  }
+
+  bool wasOff = !g_relayState;
+  g_manualOnLatched = true;
+  relayWrite(true);
+
+  // Log
+  String src(source);
+  String whoStr = who.length() > 0 ? (" (" + who + ")") : "";
+  if (wasOff) {
+    logSerialAndTg("🟢 " + src + ": Manual ON" + whoStr, true, true);
+    logUser(src + ": Role ACILDI" + whoStr);
+  }
+  return wasOff ? 0 : 2; // 0=açıldı, 2=zaten açıktı
+}
+
+// Dönüş: untilTs (0 = pencere yok)
+static time_t manualRelayOff(const char* source, const String& who = "") {
+  time_t untilTs = 0;
+  if (isTimeValid()) {
+    bool thuOn = false, spOn = false; time_t schedOff = 0;
+    getScheduleState(time(nullptr), thuOn, spOn, schedOff);
+    if (schedOff) untilTs = schedOff;
+  }
+  g_manualOffUntilTs = untilTs;
+  g_manualOnLatched = false;
+  relayWrite(false);
+
+  String src(source);
+  String whoStr = who.length() > 0 ? (" (" + who + ")") : "";
+  logSerialAndTg("🔴 " + src + ": Manual OFF" + whoStr, true, true);
+  logUser(src + ": Role KAPANDI" + whoStr);
+  return untilTs;
 }
 
 // =====================
@@ -1853,15 +1934,8 @@ static void handleButton() {
     if (lastStable != lastRead) {
       lastStable = lastRead;
       if (lastStable == LOW) {
-        g_manualOffUntilTs = 0;
-        g_manualOnLatched = true;
-        if (!g_relayState) {
-          relayWrite(true);
-          logSerialAndTg("🟢 BUTON: Manual ON verildi", true, true);
-          logUser("BUTON: Role ACILDI");
-        } else {
-          logSerialAndTg("🟢 BUTON: Manual ON (zaten ON)", true);
-        }
+        int rc = manualRelayOn("BUTON");
+        if (rc == 2) logSerialAndTg("🟢 BUTON: Manual ON (zaten ON)", true);
       }
     }
   }
@@ -2030,6 +2104,7 @@ static String fmtMin(int sec) {
 
 static String buildPanelTextMain() {
   String s;
+  s.reserve(300);
   s += "🕌 Cami Panel\n";
   s += "📌 Şerefeler: " + String(g_relayState ? "AÇIK ✅" : "KAPALI ❌") + "\n";
   s += "⏱️ Akşam tolerans: " + fmtMin(g_onOffsetSec) + " | Sabah tolerans: " + fmtMin(g_offOffsetSec) + "\n";
@@ -2269,6 +2344,7 @@ static String buildDiniGunlerWebText() {
   int cnt = buildSpListSorted();
   if (cnt == 0) return "Yakın tarihte dini gün yok";
   String out;
+  out.reserve(cnt * 120);
   for (int ii=0; ii<cnt; ii++) {
     out += formatSpItem(g_spList[ii]);
     if (out.length() > 7500) { out += "…\n"; break; }
@@ -2345,37 +2421,12 @@ static void handleTelegram() {
           } else {
             cbAnswer(qid, g_relayState ? "Kapatılıyor…" : "Açılıyor…", false);
 
-            // Toggle mantığı: ON ise OFF, OFF ise ON
             if (g_relayState) {
-              // /off benzeri
-              time_t untilTs = 0;
-              if (isTimeValid()) {
-                bool thuOn=false, spOn=false; time_t schedOff=0;
-                getScheduleState(time(nullptr), thuOn, spOn, schedOff);
-                if (schedOff) untilTs = schedOff;
-              }
-              g_manualOffUntilTs = untilTs;
-
-              g_manualOnLatched = false;
-              relayWrite(false);
-              logSerialAndTg("🔴 PANEL: Manual OFF  " + who, false, false);
-              logUser("TG Panel: Role KAPANDI (" + who + ")");
+              manualRelayOff("TG Panel", who);
             } else {
-              // /on benzeri
-              g_manualOffUntilTs = 0;
-
-              if (isTimeValid()) {
-                time_t noff=0;
-                if (computeNextImsakOff(time(nullptr), noff)) g_nextImsakOffTs = noff;
-              }
-
-              if (isTimeValid() && g_blockOnUntilTs != 0 && time(nullptr) < g_blockOnUntilTs) {
+              int rc = manualRelayOn("TG Panel", who);
+              if (rc == 1) {
                 g_mainBottom = "⛔ Şu an ON engelli (Zorunlu OFF sonrası)";
-              } else {
-                g_manualOnLatched = true;
-                relayWrite(true);
-                logSerialAndTg("🟢 PANEL: Manual ON  " + who, false, false);
-                logUser("TG Panel: Role ACILDI (" + who + ")");
               }
             }
 
@@ -2494,20 +2545,10 @@ static void handleTelegram() {
           tgSendTo(chat_id, "⛔ Yetkisiz: /on\n👤 " + who);
           logSerialAndTg("⛔ YETKISIZ /on  " + who, true, true);
         } else {
-          g_manualOffUntilTs = 0;
-
-          if (isTimeValid()) {
-            time_t noff=0;
-            if (computeNextImsakOff(time(nullptr), noff)) g_nextImsakOffTs = noff;
-          }
-
-          if (isTimeValid() && g_blockOnUntilTs != 0 && time(nullptr) < g_blockOnUntilTs) {
+          int rc = manualRelayOn("TG", who);
+          if (rc == 1) {
             tgSendTo(chat_id, "⛔ Su an ON engelli (Zorunlu OFF sonrasi).\n👤 " + who);
           } else {
-            g_manualOnLatched = true;
-            relayWrite(true);
-            logSerialAndTg("🟢 TELEGRAM: Manual ON  " + who, true, true);
-            logUser("TG: Role ACILDI (" + who + ")");
             char offb[32];
             formatDateTime(g_nextImsakOffTs, offb, sizeof(offb));
             int tolMin = (g_offOffsetSec >= 0) ? (g_offOffsetSec / 60) : 0;
@@ -2522,21 +2563,10 @@ static void handleTelegram() {
           tgSendTo(chat_id, "⛔ Yetkisiz: /off\n👤 " + who);
           logSerialAndTg("⛔ YETKISIZ /off  " + who, true, true);
         } else {
-          time_t untilTs = 0;
-          if (isTimeValid()) {
-            bool thuOn=false, spOn=false; time_t schedOff=0;
-            getScheduleState(time(nullptr), thuOn, spOn, schedOff);
-            if (schedOff) untilTs = schedOff;
-          }
-          g_manualOffUntilTs = untilTs;
+          time_t untilTs = manualRelayOff("TG", who);
 
-          g_manualOnLatched = false;
-          relayWrite(false);
-          logSerialAndTg("🔴 TELEGRAM: Manual OFF  " + who, true, true);
-          logUser("TG: Role KAPANDI (" + who + ")");
-
-          if (g_manualOffUntilTs != 0) {
-            char ub[32]; formatDateTime(g_manualOffUntilTs, ub, sizeof(ub));
+          if (untilTs != 0) {
+            char ub[32]; formatDateTime(untilTs, ub, sizeof(ub));
             tgSendTo(chat_id, "✅ Manual OFF (Scheduled override)\n⛔ Tekrar ON olmayacak (pencere bitişi): " + String(ub) + "\n👤 " + who);
           } else {
             tgSendTo(chat_id, "✅ Manual OFF\n👤 " + who);
@@ -2614,10 +2644,32 @@ static bool webAuthOk() {
 static void webSend401() {
   g_web->send(401, "application/json", "{\"ok\":false,\"err\":\"unauthorized\"}");
 }
+// Auth helper: false döndürürse zaten 401 gönderilmiştir, handler return etmeli
+static bool webRequireAuth() {
+  if (webAuthOk()) return true;
+  webSend401();
+  return false;
+}
+// JSON body parse helper: false döndürürse 400 gönderilmiştir
+static bool webParseBody(DynamicJsonDocument& doc) {
+  String body = g_web->arg("plain");
+  if (body.length() == 0 || deserializeJson(doc, body)) {
+    g_web->send(400, "application/json", "{\"ok\":false,\"err\":\"json\"}");
+    return false;
+  }
+  return true;
+}
+// JSON hata yanıt helper
+static void webSendJsonError(int code, const char* err, const char* msg = nullptr) {
+  String r = "{\"ok\":false,\"err\":\""; r += err; r += "\"";
+  if (msg) { r += ",\"msg\":\""; r += msg; r += "\""; }
+  r += "}";
+  g_web->send(code, "application/json", r);
+}
 
 // Basit yetki kontrolü endpoint'i (Public sayfadan "anahtar doğru mu" kontrolü için)
 static void webHandleAuthCheck() {
-  if (!webAuthOk()) { webSend401(); return; }
+  if (!webRequireAuth()) return;
   g_web->send(200, "application/json", "{\"ok\":true}");
 }
 
@@ -3025,7 +3077,7 @@ function saveWifi(){
   var pw=$('wfPass');var ps=pw?pw.value:'';
   if(!confirm('WiFi test edilecek: '+ss))return;
   toast('📶 Bağlantı test ediliyor...');
-  api('/api/wifitest',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ssid:ss,pass:ps})}).then(function(r){return r.json()}).then(function(d){if(d.ok){toast('✅ '+d.msg);if(pw)pw.value='';if(d.reboot)setTimeout(function(){if(d.ip)location.href='http://'+d.ip;else location.href='/'},3000)}else{toast('⛔ '+(d.msg||'Bağlantı hatası'))}}).catch(function(){toast('❌ Ağ hatası (cihaz bağlantı testi sırasında geçici erişilemez olabilir)')})
+  api('/api/wifitest',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ssid:ss,pass:ps})}).then(function(r){return r.json()}).then(function(d){if(d.testing){var pollCnt=0;var pollId=setInterval(function(){pollCnt++;api('/api/wifistatus').then(function(r){return r.json()}).then(function(s){if(s.state===3){clearInterval(pollId);toast('✅ '+s.msg);if(pw)pw.value='';if(s.ip)setTimeout(function(){location.href='http://'+s.ip},3000)}else if(s.state===5){clearInterval(pollId);toast('⛔ '+s.msg)}}).catch(function(){if(pollCnt>30)clearInterval(pollId)})},1000)}else{toast('⛔ '+(d.msg||'Hata'))}}).catch(function(){toast('❌ Ağ hatası')})
 }
 function clearWifi(){if(!confirm('WiFi NVS silinsin mi?'))return;postAcfg({creds:{clearWifi:true}},function(d){loadAdminCfg();if(d.reboot)setTimeout(function(){location.href='/'},2500)})}
 var _rstOk=false,_rstKey='';
@@ -3131,7 +3183,7 @@ static int defaultHicriYearForSpecial(uint8_t spIdx) {
 }
 
 static void webHandleGetSettings() {
-  if (!webAuthOk()) { webSend401(); return; }
+  if (!webRequireAuth()) return;
 
   DynamicJsonDocument doc(8192);
   doc["ok"] = true;
@@ -3180,7 +3232,7 @@ String out;
 }
 
 static void webHandlePostSettings() {
-  if (!webAuthOk()) { webSend401(); return; }
+  if (!webRequireAuth()) return;
 
   String body = g_web->arg("plain");
   if (body.length() == 0) { g_web->send(400, "application/json", "{\"ok\":false,\"err\":\"empty\"}"); return; }
@@ -3328,13 +3380,13 @@ static void webHandlePostSettings() {
 
 
 static void webHandleGetDiniGunler() {
-  if (!webAuthOk()) { webSend401(); return; }
+  if (!webRequireAuth()) return;
   String s = buildDiniGunlerWebText();
   g_web->send(200, "text/plain; charset=utf-8", s);
 }
 
 static void webHandleGetAdminCfg() {
-  if (!webAuthOk()) { webSend401(); return; }
+  if (!webRequireAuth()) return;
 
   DynamicJsonDocument doc(4096);
   doc["ok"] = true;
@@ -3408,7 +3460,7 @@ static bool parseIpString(const String& s, uint32_t& outPacked) {
 }
 
 static void webHandlePostAdminCfg() {
-  if (!webAuthOk()) { webSend401(); return; }
+  if (!webRequireAuth()) return;
 
   String body = g_web->arg("plain");
   if (body.length() == 0) { g_web->send(400, "application/json", "{\"ok\":false,\"err\":\"empty\"}"); return; }
@@ -3685,7 +3737,7 @@ if (doc.containsKey("creds")) {
 }
 
 static void webHandleLogs() {
-  if (!webAuthOk()) { webSend401(); return; }
+  if (!webRequireAuth()) return;
   DynamicJsonDocument doc(4096);
   doc["ok"] = true;
   JsonArray ua = doc.createNestedArray("user");
@@ -3707,81 +3759,120 @@ static void webHandleLogs() {
   g_web->send(200, "application/json", out);
 }
 
+// WiFi test state machine (non-blocking)
+static int      g_wfTestState = 0; // 0=idle,1=disconnecting,2=connecting,3=ok,4=restoring,5=fail
+static String   g_wfTestSsid, g_wfTestPass, g_wfTestOldSsid, g_wfTestOldPass;
+static uint32_t g_wfTestStartMs = 0;
+static String   g_wfTestNewIp;
+
 static void webHandleWifiTest() {
-  if (!webAuthOk()) { webSend401(); return; }
+  if (!webRequireAuth()) return;
 
-  String body = g_web->arg("plain");
-  DynamicJsonDocument doc(512);
-  if (deserializeJson(doc, body)) { g_web->send(400, "application/json", "{\"ok\":false,\"err\":\"json\"}"); return; }
-
-  String testSsid = String((const char*)(doc["ssid"] | ""));
-  String testPass = String((const char*)(doc["pass"] | ""));
-  testSsid.trim(); testPass.trim();
-  if (testSsid.length() == 0) { g_web->send(400, "application/json", "{\"ok\":false,\"err\":\"ssid\"}"); return; }
-
-  // Mevcut bağlantıyı kes
-  String oldSsid = g_wifiSsid;
-  String oldPass = g_wifiPass;
-  WiFi.disconnect(true);
-  delay(500);
-
-  // Yeni ağı dene
-  Serial.printf("[WIFI-TEST] Deneniyor: %s\n", testSsid.c_str());
-  WiFi.begin(testSsid.c_str(), testPass.c_str());
-
-  // 12sn bekle
-  bool connected = false;
-  for (int i = 0; i < 24; i++) {
-    delay(500);
-    if (WiFi.status() == WL_CONNECTED) { connected = true; break; }
+  if (g_wfTestState != 0) {
+    g_web->send(409, "application/json", "{\"ok\":false,\"err\":\"busy\",\"msg\":\"WiFi testi devam ediyor\"}");
+    return;
   }
 
-  if (connected) {
-    Serial.printf("[WIFI-TEST] BASARILI! IP=%s\n", WiFi.localIP().toString().c_str());
+  DynamicJsonDocument doc(512);
+  if (!webParseBody(doc)) return;
 
-    // NVS'e kaydet
-    prefs.putString(NVS_KEY_WIFI_SSID, testSsid);
-    if (testPass.length() > 0) prefs.putString(NVS_KEY_WIFI_PASS, testPass);
-    else prefs.remove(NVS_KEY_WIFI_PASS);
+  g_wfTestSsid = String((const char*)(doc["ssid"] | ""));
+  g_wfTestPass = String((const char*)(doc["pass"] | ""));
+  g_wfTestSsid.trim(); g_wfTestPass.trim();
+  if (g_wfTestSsid.length() == 0) {
+    g_web->send(400, "application/json", "{\"ok\":false,\"err\":\"ssid\"}");
+    return;
+  }
 
-    logUser("WEB: WiFi degistirildi (" + testSsid + ")");
-    logSys("WiFi test OK: " + testSsid);
+  // Eski WiFi bilgilerini yedekle
+  g_wfTestOldSsid = g_wifiSsid;
+  g_wfTestOldPass = g_wifiPass;
+  g_wfTestNewIp = "";
 
-    DynamicJsonDocument out(256);
+  Serial.printf("[WIFI-TEST] Baslatiliyor: %s\n", g_wfTestSsid.c_str());
+  g_wfTestState = 1;
+  g_wfTestStartMs = millis();
+
+  g_web->send(200, "application/json", "{\"ok\":true,\"msg\":\"WiFi testi baslatildi\",\"testing\":true}");
+}
+
+static void webHandleWifiStatus() {
+  if (!webRequireAuth()) return;
+  DynamicJsonDocument out(256);
+  out["state"] = g_wfTestState;
+  if (g_wfTestState == 3) {
     out["ok"] = true;
     out["msg"] = "WiFi baglantisi basarili! Yeniden baslatiliyor...";
-    out["ip"] = WiFi.localIP().toString();
+    out["ip"] = g_wfTestNewIp;
     out["reboot"] = true;
-    String outStr;
-    serializeJson(out, outStr);
-    g_web->send(200, "application/json", outStr);
-
-    scheduleRestart(1500, "WiFi test OK - reboot");
-  } else {
-    Serial.println("[WIFI-TEST] BASARISIZ - eski WiFi'ye donuluyor");
-
-    // Eski WiFi'ye geri dön
-    WiFi.disconnect(true);
-    delay(300);
-    WiFi.begin(oldSsid.c_str(), oldPass.c_str());
-    // Eski bağlantıyı bekle (5sn)
-    for (int i = 0; i < 10; i++) { delay(500); if (WiFi.status() == WL_CONNECTED) break; }
-
-    logSys("WiFi test FAIL: " + testSsid);
-
-    DynamicJsonDocument out(256);
+  } else if (g_wfTestState == 5) {
     out["ok"] = false;
-    out["err"] = "wifi_fail";
     out["msg"] = "WiFi baglantisi basarisiz! Parola hatali veya ag bulunamadi.";
-    String outStr;
-    serializeJson(out, outStr);
-    g_web->send(200, "application/json", outStr);
+  } else {
+    out["ok"] = true;
+    out["msg"] = "Test devam ediyor...";
+  }
+  String s;
+  serializeJson(out, s);
+  g_web->send(200, "application/json", s);
+}
+
+static void wifiTestTick() {
+  if (g_wfTestState == 0) return;
+
+  switch (g_wfTestState) {
+    case 1: // Disconnect
+      WiFi.disconnect(true);
+      g_wfTestStartMs = millis();
+      g_wfTestState = 2;
+      WiFi.begin(g_wfTestSsid.c_str(), g_wfTestPass.c_str());
+      Serial.printf("[WIFI-TEST] Deneniyor: %s\n", g_wfTestSsid.c_str());
+      break;
+
+    case 2: // Bağlanmayı bekle (12sn timeout)
+      if (WiFi.status() == WL_CONNECTED) {
+        g_wfTestNewIp = WiFi.localIP().toString();
+        Serial.printf("[WIFI-TEST] BASARILI! IP=%s\n", g_wfTestNewIp.c_str());
+
+        prefs.putString(NVS_KEY_WIFI_SSID, g_wfTestSsid);
+        if (g_wfTestPass.length() > 0) prefs.putString(NVS_KEY_WIFI_PASS, g_wfTestPass);
+        else prefs.remove(NVS_KEY_WIFI_PASS);
+
+        logUser("WEB: WiFi degistirildi (" + g_wfTestSsid + ")");
+        logSys("WiFi test OK: " + g_wfTestSsid);
+        g_wfTestState = 3;
+        scheduleRestart(3000, "WiFi test OK - reboot");
+      } else if (millis() - g_wfTestStartMs > 12000) {
+        Serial.println("[WIFI-TEST] BASARISIZ - eski WiFi'ye donuluyor");
+        logSys("WiFi test FAIL: " + g_wfTestSsid);
+        WiFi.disconnect(true);
+        g_wfTestStartMs = millis();
+        g_wfTestState = 4;
+        WiFi.begin(g_wfTestOldSsid.c_str(), g_wfTestOldPass.c_str());
+      }
+      break;
+
+    case 4: // Eski WiFi'ye dönüş bekle (8sn)
+      if (WiFi.status() == WL_CONNECTED || millis() - g_wfTestStartMs > 8000) {
+        g_wfTestState = 5; // Sonuç: fail
+      }
+      break;
+
+    case 5: // Fail — 10sn sonra idle'a dön
+      if (millis() - g_wfTestStartMs > 18000) { // totalde ~20sn sonra
+        g_wfTestState = 0;
+        g_wfTestSsid = ""; g_wfTestPass = "";
+        g_wfTestOldSsid = ""; g_wfTestOldPass = "";
+      }
+      break;
   }
 }
 
 static void webHandleWifiScan() {
-  if (!webAuthOk()) { webSend401(); return; }
-  int n = WiFi.scanNetworks(false, false, false, 300);
+  if (!webRequireAuth()) return;
+  esp_task_wdt_reset(); // Scan uzun sürebilir, WDT besle
+  int n = WiFi.scanNetworks(false, false, false, 200); // 200ms/kanal
+  esp_task_wdt_reset();
   DynamicJsonDocument doc(2048);
   JsonArray arr = doc.createNestedArray("networks");
   if (n > 0) {
@@ -3800,7 +3891,7 @@ static void webHandleWifiScan() {
 }
 
 static void webHandlePostAction() {
-  if (!webAuthOk()) { webSend401(); return; }
+  if (!webRequireAuth()) return;
 
   String body = g_web->arg("plain");
   if (body.length() == 0) { g_web->send(400, "application/json", "{\"ok\":false,\"err\":\"empty\"}"); return; }
@@ -3839,33 +3930,19 @@ static void webHandlePostAction() {
     }
   }
   else if (cmd == "relayOn") {
-    g_manualOffUntilTs = 0;
-    if (isTimeValid() && g_blockOnUntilTs != 0 && time(nullptr) < g_blockOnUntilTs) {
+    int rc = manualRelayOn("WEB");
+    if (rc == 1) {
       out["err"] = "blocked";
       out["msg"] = "⛔ ON engelli (zorunlu OFF sonrası)";
     } else {
-      g_manualOnLatched = true;
-      relayWrite(true);
       out["ok"] = true;
       out["msg"] = "🟢 Şerefeler AÇILDI";
-      logSerialAndTg("🟢 WEB: Manual ON", false, false);
-      logUser("WEB: Role ACILDI");
     }
   }
   else if (cmd == "relayOff") {
-    g_manualOnLatched = false;
-    time_t untilTs = 0;
-    if (isTimeValid()) {
-      bool thuOn=false, spOn=false; time_t schedOff=0;
-      getScheduleState(time(nullptr), thuOn, spOn, schedOff);
-      if (schedOff) untilTs = schedOff;
-    }
-    g_manualOffUntilTs = untilTs;
-    relayWrite(false);
+    manualRelayOff("WEB");
     out["ok"] = true;
     out["msg"] = "🔴 Şerefeler KAPANDI";
-    logSerialAndTg("🔴 WEB: Manual OFF", false, false);
-    logUser("WEB: Role KAPANDI");
   }
   else if (cmd == "cancelUpdate") {
     if (g_updatePending) {
@@ -3900,7 +3977,7 @@ static void webHandlePostAction() {
 
 
 static void webHandlePostFactoryReset() {
-  if (!webAuthOk()) { webSend401(); return; }
+  if (!webRequireAuth()) return;
 
   String body = g_web->arg("plain");
   if (body.length() == 0) { g_web->send(400, "application/json", "{\"ok\":false,\"err\":\"empty\"}"); return; }
@@ -4021,8 +4098,10 @@ static void logHeapIfNeeded() {
   lastCheckMs = now;
   uint32_t freeH = ESP.getFreeHeap();
 
-  // Özellik 5: Son çalışma zamanını NVS'e kaydet (5dk arayla)
-  if (isTimeValid()) {
+  // Özellik 5: Son çalışma zamanını NVS'e kaydet (15dk arayla — flash ömrü koruma)
+  static uint32_t lastAliveMs = 0;
+  if ((now - lastAliveMs) >= 900000UL && isTimeValid()) { // 15 dakika
+    lastAliveMs = now;
     prefs.putULong(NVS_KEY_LAST_ALIVE, (uint32_t)time(nullptr));
   }
 
@@ -4030,8 +4109,8 @@ static void logHeapIfNeeded() {
   if (freeH < 10240) { // < 10KB kritik
     Serial.printf("[HEAP] KRITIK! %u bytes - otomatik restart\n", freeH);
     logSys("Heap kritik (" + String(freeH) + "B), reboot");
-    tgSend("⚠️ Heap kritik: " + String(freeH) + " bytes - otomatik restart", true);
-    delay(500);
+    // NOT: tgSend() burada çağrılmaz — TLS handshake ~15KB heap ister, crash döngüsüne neden olur
+    delay(200);
     ESP.restart();
   }
   if (freeH < 20480) { // < 20KB uyarı
@@ -4040,7 +4119,7 @@ static void logHeapIfNeeded() {
 }
 
 static void webHandleOtaFinish() {
-  if (!webAuthOk()) { webSend401(); return; }
+  if (!webRequireAuth()) return;
 
   if (g_otaBoardMismatch) {
     g_web->send(400, "application/json",
@@ -4077,7 +4156,7 @@ static void webHandleOtaFinish() {
 // /api/system - Detaylı sistem bilgisi
 // =====================
 static void webHandleSystem() {
-  if (!webAuthOk()) { webSend401(); return; }
+  if (!webRequireAuth()) return;
 
   DynamicJsonDocument doc(2048);
   doc["ok"] = true;
@@ -4206,6 +4285,7 @@ static void webSetup() {
   g_web->on("/api/logs", HTTP_GET, webHandleLogs);
   g_web->on("/api/wifiscan", HTTP_GET, webHandleWifiScan);
   g_web->on("/api/wifitest", HTTP_POST, webHandleWifiTest);
+  g_web->on("/api/wifistatus", HTTP_GET, webHandleWifiStatus);
 
   // Web OTA upload
   g_web->on("/update", HTTP_POST, webHandleOtaFinish, webHandleOtaUpload);
@@ -4390,6 +4470,7 @@ void loop() {
   handleButton();
   weeklyUpdateTick();
   weeklyRestartTick();
+  wifiTestTick();
 
   if (isTimeValid()) {
     time_t now = time(nullptr);
